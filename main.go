@@ -1,6 +1,9 @@
 package main
 
-import "log"
+import (
+	"github.com/emersion/go-imap/client"
+	"log"
+)
 
 func main() {
 	imapUser := ""
@@ -18,7 +21,12 @@ func main() {
 	if err != nil {
 		log.Fatal("IMAP connection error:", err)
 	}
-	defer c.Logout()
+	defer func(c *client.Client) {
+		err := c.Logout()
+		if err != nil {
+			log.Fatal("Logout error:", err)
+		}
+	}(c)
 
 	messages, err := fetchEmails(c)
 	if err != nil {
@@ -30,7 +38,7 @@ func main() {
 		return
 	}
 
-	err = foewardMails(messages, smtpHost, smtpPort, smtpUser, smtpPass, destEmail)
+	err = forwardEmails(messages, smtpHost, smtpPort, smtpUser, smtpPass, destEmail)
 	if err != nil {
 		log.Fatal("Forward emails error:", err)
 	}

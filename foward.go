@@ -2,8 +2,10 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
+	"sync"
 
 	"github.com/emersion/go-imap"
 	// "github.com/emersion/go-imap/client"
@@ -11,62 +13,79 @@ import (
 	"github.com/go-gomail/gomail"
 )
 
-func foewardMails(messages []*imap.Message, smtpHost string, smtpPort int, smtpUser, smtpPass, destinationEmail string) error {
+func forwardEmails(messages []*imap.Message, smtpHost string, smtpPort int, smtpUser, smtpPass, destinationEmail string) error {
+	sem := make(chan struct{}, 10) // 限制最大并发数为10
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errList []error
 	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		section := &imap.BodySectionName{}
-		r := msg.GetBody(section)
-		if r == nil {
-			log.Println("server can't fetch message body")
-			continue
-		}
-		mr, err := mail.CreateReader(r)
-		if err != nil {
-			log.Println("can not read the mail", err)
-			continue
-		}
-		m := gomail.NewMessage()
-		m.SetHeader("From", smtpUser)
-		m.SetHeader("To", destinationEmail)
-		m.SetHeader("Subject", "Fwd: "+msg.Envelope.Subject)
+		wg.Add(1)
+		sem <- struct{}{} // 当并发超过10时会阻塞
 
-		for {
-			part, err := mr.NextPart()
-			if err == io.EOF {
-				break
+		go func(msg *imap.Message) {
+			defer wg.Done()
+			defer func() { <-sem }() // 处理完释放一个并发槽
+
+			if msg == nil {
+				return
 			}
+			section := &imap.BodySectionName{}
+			r := msg.GetBody(section)
+			if r == nil {
+				log.Println("server can't fetch message body")
+				return
+			}
+			mr, err := mail.CreateReader(r)
 			if err != nil {
-				log.Println("read mail error", err)
-				break
+				log.Println("can not read the mail", err)
+				return
 			}
-			switch h := part.Header.(type) {
-			case *mail.InlineHeader:
-				b, _ := io.ReadAll(part.Body)
-				currentType, _, _ := h.ContentType()
-				if currentType == "text/plain" {
-					m.SetBody("text/plain", string(b))
-				} else if currentType == "text/html" {
-					m.SetBody("text/html", string(b))
+			m := gomail.NewMessage()
+			m.SetHeader("From", smtpUser)
+			m.SetHeader("To", destinationEmail)
+			m.SetHeader("Subject", "Fwd: "+msg.Envelope.Subject)
+
+			for {
+				part, err := mr.NextPart()
+				if err == io.EOF {
+					break
 				}
-			case *mail.AttachmentHeader:
-				fileName, _ := h.Filename()
-				m.Attach(fileName, gomail.SetCopyFunc(func(w io.Writer) error {
-					_, err := io.Copy(w, part.Body)
-					return err
-				}))
+				if err != nil {
+					log.Println("read mail error", err)
+					break
+				}
+				switch h := part.Header.(type) {
+				case *mail.InlineHeader:
+					b, _ := io.ReadAll(part.Body)
+					currentType, _, _ := h.ContentType()
+					if currentType == "text/plain" {
+						m.SetBody("text/plain", string(b))
+					} else if currentType == "text/html" {
+						m.SetBody("text/html", string(b))
+					}
+				case *mail.AttachmentHeader:
+					fileName, _ := h.Filename()
+					m.Attach(fileName, gomail.SetCopyFunc(func(w io.Writer) error {
+						_, err := io.Copy(w, part.Body)
+						return err
+					}))
+				}
 			}
-		}
-		d := gomail.NewDialer(smtpHost, smtpPort, smtpUser, smtpPass)
-		d.TLSConfig = &tls.Config{InsecureSkipVerify: false}
+			d := gomail.NewDialer(smtpHost, smtpPort, smtpUser, smtpPass)
+			d.TLSConfig = &tls.Config{InsecureSkipVerify: false}
 
-		if err := d.DialAndSend(m); err != nil {
-			log.Println("can not send mail", err)
-			continue
-		}
-
-		log.Println("mail forwarded", msg.Envelope.Subject)
+			if err := d.DialAndSend(m); err != nil {
+				log.Println("cannot send mail", err)
+				mu.Lock()
+				errList = append(errList, err)
+				mu.Unlock()
+				return
+			}
+		}(msg)
+	}
+	wg.Wait()
+	if len(errList) > 0 {
+		return errors.Join(errList...)
 	}
 	return nil
 }
